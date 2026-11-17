@@ -1,4 +1,8 @@
-"""Course-provided language model wrapper.
+"""Language model wrapper with configurable OpenAI-compatible providers.
+
+Set CS329Z_LM_PROVIDER to openai (default), deepseek, or openrouter.
+Each provider uses its own API key environment variable. Model names can be
+overridden with CS329Z_GRADING_MODEL, CS329Z_USER_MODEL and CS329Z_JUDGE_MODEL.
 
 This module gives you exactly one primitive: a chat-completion call that takes
 a list of messages and returns a string.
@@ -47,15 +51,22 @@ Message = dict  # {"role": "system" | "user" | "assistant", "content": str}
 # Model used for each role. Override any of these with the environment
 # variable CS329Z_<ROLE>_MODEL, e.g. CS329Z_GRADING_MODEL.
 DEFAULT_MODELS = {
-    "grading": "openai/gpt-6-luna",  # the model your agent is graded with
-    "user": "openai/gpt-6-luna",  # plays the simulated users
-    "judge": "openai/gpt-6-sol",  # scores evaluation transcripts
+    "grading": "gpt-5.4-mini",
+    "user": "gpt-5.4-mini",
+    "judge": "gpt-5.4",
 }
 
-# Calls go to OpenRouter, which fronts many providers behind one
-# OpenAI-compatible API. Model names carry the provider as a prefix
-# ("openai/gpt-6-luna"); https://openrouter.ai/models lists them.
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
+PROVIDERS = {
+    "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
+    "deepseek": ("https://api.deepseek.com", "DEEPSEEK_API_KEY"),
+    "openrouter": (OPENROUTER_URL, "OPENROUTER_API_KEY"),
+}
+PROVIDER_MODELS = {
+    "openai": DEFAULT_MODELS,
+    "deepseek": {"grading": "deepseek-flash", "user": "deepseek-flash", "judge": "deepseek-v4-pro"},
+    "openrouter": {"grading": "openai/gpt-6-luna", "user": "openai/gpt-6-luna", "judge": "openai/gpt-6-sol"},
+}
 
 # Reasoning effort requested from models that accept it (GPT-5 and GPT-6).
 # Override with CS329Z_REASONING_EFFORT.
@@ -69,6 +80,10 @@ DEFAULT_REASONING_EFFORT = "low"
 # https://openrouter.ai/models on 2026-10-05 (the same as OpenAI's list
 # prices).
 PRICES = {
+    # DeepSeek peak rates used as conservative estimates (2026-11-13).
+    # https://api-docs.deepseek.com/quick_start/pricing/
+    "deepseek-flash": (0.30, 0.006, 1.20),
+    "deepseek-v4-pro": (1.32, 0.044, 3.96),
     "gpt-4.1": (2.00, 0.50, 8.00),
     "gpt-4.1-mini": (0.40, 0.10, 1.60),
     "gpt-4.1-nano": (0.10, 0.025, 0.40),
@@ -122,6 +137,13 @@ class OutputTruncated(RuntimeError):
         )
 
 
+def resolve_provider() -> str:
+    provider = os.environ.get("CS329Z_LM_PROVIDER", "openai").strip().lower()
+    if provider not in PROVIDERS:
+        raise ValueError(f"CS329Z_LM_PROVIDER must be one of {tuple(PROVIDERS)}, got {provider!r}")
+    return provider
+
+
 def resolve_model(role_or_model: str | None = None) -> str:
     """Map a role ("grading", "user", "judge") to a model name.
 
@@ -130,7 +152,7 @@ def resolve_model(role_or_model: str | None = None) -> str:
     """
     name = role_or_model or "grading"
     if name in DEFAULT_MODELS:
-        return os.environ.get(f"CS329Z_{name.upper()}_MODEL", DEFAULT_MODELS[name])
+        return os.environ.get(f"CS329Z_{name.upper()}_MODEL") or PROVIDER_MODELS[resolve_provider()][name]
     return name
 
 
@@ -169,8 +191,8 @@ def _load_env() -> None:
 _ledger_lock = threading.Lock()
 # Models that reject the temperature or reasoning_effort parameters, learned
 # from the provider's error the first time each is used.
-_NO_TEMPERATURE: set[str] = set()
-_NO_EFFORT: set[str] = set()
+_NO_TEMPERATURE: set[tuple[str, str]] = set()
+_NO_EFFORT: set[tuple[str, str]] = set()
 
 
 def read_ledger() -> list[dict]:
@@ -220,8 +242,8 @@ class LM:
     Parameters
     ----------
     model:
-        A role ("grading", "user", "judge"), an OpenRouter model name such
-        as "openai/gpt-6-sol", or ``None`` for "grading".
+        A role ("grading", "user", "judge"), a model name accepted by the
+        configured provider, or ``None`` for "grading".
     temperature, max_tokens:
         Sampling settings. They are part of the cache key. Reasoning models
         spend part of ``max_tokens`` on hidden reasoning, so keep it large.
@@ -247,8 +269,22 @@ class LM:
         salt: str = "",
     ) -> None:
         _load_env()
+        self.provider = resolve_provider()
+        default_url, self.api_key_env = PROVIDERS[self.provider]
+        self.base_url = (
+            os.environ.get("CS329Z_BASE_URL")
+            or (os.environ.get("OPENAI_BASE_URL") if self.provider == "openai" else None)
+            or default_url
+        ).rstrip("/")
         self.model = resolve_model(model)
+        if self.provider == "openai":
+            self.model = self.model.removeprefix("openai/")
+            if self.model.startswith("deepseek"):
+                raise ValueError("OpenAI provider cannot use a DeepSeek model. Update CS329Z_GRADING_MODEL (and any user/judge overrides), or set CS329Z_LM_PROVIDER=deepseek.")
+        elif self.provider == "deepseek" and not self.model.startswith("deepseek"):
+            raise ValueError("DeepSeek provider requires a DeepSeek model. Remove incompatible CS329Z_*_MODEL overrides.")
         _price(self.model)  # fail now, not after a paid call, if the price is unknown
+        self.reasoning_effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT).strip()
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.tag = tag
@@ -290,6 +326,7 @@ class LM:
         _append_ledger(
             {
                 "ts": round(start, 3),
+                "provider": self.provider,
                 "model": self.model,
                 "tag": self.tag or os.environ.get("CS329Z_TAG", ""),
                 "input_tokens": usage["input"],
@@ -318,6 +355,7 @@ class LM:
     def usage(self) -> dict:
         """Totals for this instance since it was created."""
         return {
+            "provider": self.provider,
             "model": self.model,
             "calls": self.calls,
             "cached_calls": self.cached_calls,
@@ -330,9 +368,9 @@ class LM:
     # -- internals --------------------------------------------------------
 
     def _key(self, messages: list[Message]) -> str:
-        effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
         blob = json.dumps(
-            [self.model, self.temperature, self.max_tokens, effort, self.salt, messages],
+            [self.provider, self.base_url, self.model, self.temperature, self.max_tokens,
+             self.reasoning_effort, self.salt, messages],
             sort_keys=True,
             ensure_ascii=False,
         )
@@ -349,54 +387,75 @@ class LM:
                 "Raise the cap in .env if you mean to continue."
             )
 
+    def _request_kwargs(self, messages: list[Message]) -> dict:
+        """Keep provider-specific extensions out of other providers' requests."""
+        kwargs: dict = {"model": self.model, "messages": messages}
+        capability_key = (self.base_url, self.model)
+        reasoning_model = self.model.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
+        if capability_key not in _NO_TEMPERATURE and not (self.provider == "openai" and reasoning_model):
+            kwargs["temperature"] = self.temperature
+        if self.provider == "openai":
+            kwargs["max_completion_tokens"] = self.max_tokens
+            if reasoning_model and self.reasoning_effort and capability_key not in _NO_EFFORT:
+                kwargs["reasoning_effort"] = self.reasoning_effort
+        else:
+            kwargs["max_tokens"] = self.max_tokens
+            if self.provider == "openrouter":
+                kwargs["extra_body"] = {"usage": {"include": True}}
+                if self.reasoning_effort and capability_key not in _NO_EFFORT:
+                    kwargs["extra_body"]["reasoning"] = {"effort": self.reasoning_effort}
+            else:
+                # This assignment consumes plain text, without hidden thinking.
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        return kwargs
+
     def _complete(self, messages: list[Message]) -> tuple[str, dict]:
         if self._client is None:
             from openai import OpenAI
 
-            key = os.environ.get("OPENROUTER_API_KEY")
+            key = os.environ.get(self.api_key_env)
             if not key:
                 raise RuntimeError(
-                    "OPENROUTER_API_KEY is not set. Copy .env.example to .env and add your key."
+                    f"{self.api_key_env} is not set for provider {self.provider!r}. "
+                    "Set it in your environment or .env; keys from other providers cannot be substituted."
                 )
             self._client = OpenAI(
-                base_url=OPENROUTER_URL,
+                base_url=self.base_url,
                 api_key=key,
-                max_retries=6,
+                max_retries=2,
                 timeout=120,
-                default_headers={"X-Title": "CS329Z HW1"},
+                default_headers={"X-Title": "CS329Z HW1"} if self.provider == "openrouter" else {},
             )
-        kwargs: dict = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": self.max_tokens,
-            # OpenRouter extensions: the reasoning effort, and the request
-            # that the response carry the cost of the call.
-            "extra_body": {"usage": {"include": True}},
-        }
-        if self.model not in _NO_TEMPERATURE:
-            kwargs["temperature"] = self.temperature
-        effort = os.environ.get("CS329Z_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
-        if effort and self.model not in _NO_EFFORT:
-            kwargs["extra_body"]["reasoning"] = {"effort": effort}
-        try:
-            response = self._client.chat.completions.create(**kwargs)
-        except Exception as exc:  # some models reject temperature or reasoning effort
-            text = str(exc)
-            if "temperature" in text and "temperature" in kwargs:
-                _NO_TEMPERATURE.add(self.model)
-                kwargs.pop("temperature")
+        from openai import BadRequestError
+
+        kwargs = self._request_kwargs(messages)
+        capability_key = (self.base_url, self.model)
+        for attempt in range(3):
+            try:
                 response = self._client.chat.completions.create(**kwargs)
-            elif "reasoning" in text and "reasoning" in kwargs["extra_body"]:
-                _NO_EFFORT.add(self.model)
-                kwargs["extra_body"].pop("reasoning")
-                response = self._client.chat.completions.create(**kwargs)
-            else:
-                raise
+                break
+            except BadRequestError as exc:
+                if attempt == 2:
+                    raise
+                text = str(exc).lower()
+                if "temperature" in text and "temperature" in kwargs:
+                    _NO_TEMPERATURE.add(capability_key)
+                    kwargs.pop("temperature")
+                elif "reasoning" in text and "reasoning_effort" in kwargs:
+                    _NO_EFFORT.add(capability_key)
+                    kwargs.pop("reasoning_effort")
+                elif "reasoning" in text and "reasoning" in kwargs.get("extra_body", {}):
+                    _NO_EFFORT.add(capability_key)
+                    kwargs["extra_body"].pop("reasoning")
+                else:
+                    raise
         choice = response.choices[0]
         text = choice.message.content or ""
         u = response.usage
         details = getattr(u, "prompt_tokens_details", None)
-        cached = getattr(details, "cached_tokens", 0) or 0
+        cached = getattr(details, "cached_tokens", None)
+        if cached is None:
+            cached = getattr(u, "prompt_cache_hit_tokens", 0) or 0
         out_details = getattr(u, "completion_tokens_details", None)
         reasoning = getattr(out_details, "reasoning_tokens", 0) or 0
         usage = {
