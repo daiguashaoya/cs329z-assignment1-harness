@@ -3,6 +3,7 @@
 from copy import deepcopy
 from dataclasses import replace
 
+from cs329z_hw1.agent.cardinal_tools import assemble_tools
 from cs329z_hw1.agent.tool_protocol import parse_response, render_tools
 from cs329z_hw1.agent.tool_registry import ToolRegistry
 from cs329z_hw1.llm import OutputTruncated
@@ -15,12 +16,9 @@ from cs329z_hw1.types import (
 
 class AgentSession:
     def __init__(self, lm: LMCallable, tools: list[ToolSpec] | None, config: AgentConfig):
-        if tools is None:
-            raise NotImplementedError(
-                "The default Cardinal toolset belongs to the next problem; pass explicit tools."
-            )
         self.lm = lm
         self.config = replace(config)
+        tools = assemble_tools(lm, tools, self.config)
         self.registry = ToolRegistry(tools)
         self._read_only = {tool.name: tool.read_only for tool in tools}
         self.transcript: list[dict] = []
