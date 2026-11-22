@@ -15,8 +15,20 @@ DESCRIPTIONS = {
     "read_email": "Read the full email for an email_id returned by a search.",
     "email_qa": "Answer a question using up to three email searches and cite supporting email IDs.",
     "daily_digest": "Summarize emails from one UTC date, with urgent work first and irrelevant mail excluded.",
-    "search_docs": "Search company policy and project documents; returns document IDs and snippets.",
-    "read_doc": "Read a document window from start_line; use returned end_line to continue paging.",
+    "search_docs": (
+        "Search company policy and project documents using short distinctive keywords. "
+        "Returns IDs, titles, source snippets and start_line pointers. For policy questions, "
+        "prefer these document tools. Check applicable dates and newer announcements: "
+        "a later explicit policy update supersedes an older handbook or policy. "
+        "Keep all search_docs and read_doc results within 6000 tokens per question; "
+        "use small k and targeted reads rather than reading every search result."
+    ),
+    "read_doc": (
+        "Read original document lines from start_line (default 1). Use the search result's "
+        "start_line to jump to relevant evidence; end_line + 1 continues without gaps. "
+        "Returns about 1000 tokens per page. Read enough context to establish the answer "
+        "and verify superseding updates, then answer with the source document ID."
+    ),
     "run_terminal": "Run a shell command in the configured terminal workspace; returns stdout, stderr and exit status.",
     "remember": "Save a useful fact to the configured persistent memory store.",
     "recall": "Find previously saved facts matching query keywords in persistent memory.",
