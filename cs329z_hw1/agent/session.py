@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 
 from cs329z_hw1.agent.cardinal_tools import assemble_tools
+from cs329z_hw1.agent.compaction import compact_context
 from cs329z_hw1.agent.observations import preview
 from cs329z_hw1.agent.tool_protocol import parse_response, render_tools
 from cs329z_hw1.agent.tool_registry import ToolRegistry
@@ -23,7 +24,8 @@ class AgentSession:
         self.registry = ToolRegistry(tools)
         self._read_only = {tool.name: tool.read_only for tool in tools}
         self.transcript: list[dict] = []
-        self._terminal_messages: list[int] = []
+        self._current_user: Message | None = None
+        self._latest_feedback: Message | None = None
         self._messages: list[Message] = [{
             "role": "system",
             "content": (
@@ -45,8 +47,10 @@ class AgentSession:
         self._messages.append({"role": role, "content": content})
 
     def _error(self, content: str) -> None:
+        content = self._observe_result(ToolResult("tool_error", content)).content
         self.transcript.append({"type": "error", "content": content})
         self._messages.append({"role": "user", "content": content})
+        self._latest_feedback = self._messages[-1]
 
     def _finish(self, text: str, status: StopReason) -> AgentResult:
         # A caller keeps a snapshot, not a reference to a growing event list.
@@ -68,23 +72,17 @@ class AgentSession:
         # Keep the parsed call and event log separate from mutable tool inputs.
         return self.registry.execute(call.name, deepcopy(call.args))
 
-    def _observe_terminal(self, result: ToolResult) -> ToolResult:
-        """Make room for this observation without rewriting the event log."""
-        # Reserve space for the tool-message framing and a subsequent reply.
-        reserve = 256
-        wanted = min(count_tokens(result.content), 1500)
-        for position in self._terminal_messages:
-            if count_message_tokens(self._messages) + wanted + reserve <= self.config.context_budget:
-                break
-            message = self._messages[position]
-            message["content"] = preview(message["content"], 128 * CHARS_PER_TOKEN)
-        available = max(
-            0, self.config.context_budget - count_message_tokens(self._messages) - reserve
-        )
-        return ToolResult(result.status, preview(result.content, available * CHARS_PER_TOKEN))
+    def _observe_result(self, result: ToolResult) -> ToolResult:
+        """Bound all observations before logging; leave room for pinned messages."""
+        base = count_message_tokens([self._messages[0], self._current_user])
+        available = max(0, self.config.context_budget - base - 64)
+        limit = min(1500, self.config.context_budget // 4, available)
+        return ToolResult(result.status, preview(result.content, limit * CHARS_PER_TOKEN))
 
     def send(self, user_message: str) -> AgentResult:
         self._message("user", user_message)
+        self._current_user = self._messages[-1]
+        self._latest_feedback = None
         turns = 0
         spent_tokens = 0
         consecutive_malformed = 0
@@ -96,7 +94,12 @@ class AgentSession:
             if spent_tokens >= self.config.token_budget:
                 return self._finish("Stopped: token budget reached.", "token_budget")
 
+            self._messages = compact_context(
+                self._messages, self._current_user, self._latest_feedback,
+                self.config.context_budget, self.config.aux_lm,
+            )
             messages = deepcopy(self._messages)
+            self._latest_feedback = None
             input_tokens = count_message_tokens(messages)
             turns += 1
             try:
@@ -127,18 +130,16 @@ class AgentSession:
                         "type": "tool_call", "name": call.name, "args": deepcopy(call.args),
                     })
                     result = self._execute(call)
-                    if call.name == "run_terminal":
-                        result = self._observe_terminal(result)
+                    result = self._observe_result(result)
                     self.transcript.append({
                         "type": "tool_result", "name": call.name,
                         "status": result.status, "content": result.content,
                     })
-                    if call.name == "run_terminal":
-                        self._terminal_messages.append(len(self._messages))
                     self._messages.append({
                         "role": "user",
                         "content": f"Tool result for {call.name} ({result.status}):\n{result.content}",
                     })
+                    self._latest_feedback = self._messages[-1]
                     if result.status in ("unknown_tool", "invalid_args"):
                         consecutive_malformed += 1
                     else:
