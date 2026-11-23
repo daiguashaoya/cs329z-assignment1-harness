@@ -4,10 +4,11 @@ from copy import deepcopy
 from dataclasses import replace
 
 from cs329z_hw1.agent.cardinal_tools import assemble_tools
+from cs329z_hw1.agent.observations import preview
 from cs329z_hw1.agent.tool_protocol import parse_response, render_tools
 from cs329z_hw1.agent.tool_registry import ToolRegistry
 from cs329z_hw1.llm import OutputTruncated
-from cs329z_hw1.tokens import count_message_tokens, count_tokens
+from cs329z_hw1.tokens import CHARS_PER_TOKEN, count_message_tokens, count_tokens
 from cs329z_hw1.types import (
     AgentConfig, AgentResult, LMCallable, Message, StopReason, ToolCall,
     ToolResult, ToolSpec,
@@ -22,6 +23,7 @@ class AgentSession:
         self.registry = ToolRegistry(tools)
         self._read_only = {tool.name: tool.read_only for tool in tools}
         self.transcript: list[dict] = []
+        self._terminal_messages: list[int] = []
         self._messages: list[Message] = [{
             "role": "system",
             "content": (
@@ -65,6 +67,21 @@ class AgentSession:
                 return ToolResult("denied", f"User declined the call: {approval.reason}")
         # Keep the parsed call and event log separate from mutable tool inputs.
         return self.registry.execute(call.name, deepcopy(call.args))
+
+    def _observe_terminal(self, result: ToolResult) -> ToolResult:
+        """Make room for this observation without rewriting the event log."""
+        # Reserve space for the tool-message framing and a subsequent reply.
+        reserve = 256
+        wanted = min(count_tokens(result.content), 1500)
+        for position in self._terminal_messages:
+            if count_message_tokens(self._messages) + wanted + reserve <= self.config.context_budget:
+                break
+            message = self._messages[position]
+            message["content"] = preview(message["content"], 128 * CHARS_PER_TOKEN)
+        available = max(
+            0, self.config.context_budget - count_message_tokens(self._messages) - reserve
+        )
+        return ToolResult(result.status, preview(result.content, available * CHARS_PER_TOKEN))
 
     def send(self, user_message: str) -> AgentResult:
         self._message("user", user_message)
@@ -110,10 +127,14 @@ class AgentSession:
                         "type": "tool_call", "name": call.name, "args": deepcopy(call.args),
                     })
                     result = self._execute(call)
+                    if call.name == "run_terminal":
+                        result = self._observe_terminal(result)
                     self.transcript.append({
                         "type": "tool_result", "name": call.name,
                         "status": result.status, "content": result.content,
                     })
+                    if call.name == "run_terminal":
+                        self._terminal_messages.append(len(self._messages))
                     self._messages.append({
                         "role": "user",
                         "content": f"Tool result for {call.name} ({result.status}):\n{result.content}",

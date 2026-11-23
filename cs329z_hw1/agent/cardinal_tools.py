@@ -1,10 +1,11 @@
 """Assemble Cardinal tools with session-local, lazily loaded resources."""
 
 from copy import deepcopy
-from dataclasses import asdict
 import json
+from pathlib import Path
 
 from cs329z_hw1 import adapters, data
+from cs329z_hw1.agent.observations import terminal_observation
 from cs329z_hw1.cardinal import CARDINAL_TOOLS, cardinal_spec
 from cs329z_hw1.tokenizer import tokenize
 from cs329z_hw1.types import AgentConfig, Email, LMCallable, ToolSpec
@@ -29,7 +30,14 @@ DESCRIPTIONS = {
         "Returns about 1000 tokens per page. Read enough context to establish the answer "
         "and verify superseding updates, then answer with the source document ID."
     ),
-    "run_terminal": "Run a shell command in the configured terminal workspace; returns stdout, stderr and exit status.",
+    "run_terminal": (
+        "Run a Bash shell command in the configured workspace, which contains emails.jsonl "
+        "(one JSON email per line) and docs/. Use python3 for exact archive computations. "
+        "Returns stdout, stderr and exit status; failures are observations you can correct. "
+        "Long output is a head/tail preview with saved output paths. Never infer counts "
+        "or middle lines from a preview: use wc -l or sed -n 'START,ENDp' on the saved "
+        "file. Preserve empty lines when counting. Prefer small, targeted outputs."
+    ),
     "remember": "Save a useful fact to the configured persistent memory store.",
     "recall": "Find previously saved facts matching query keywords in persistent memory.",
     "ask_user": "Ask the user a clarification question through the configured user interface.",
@@ -93,7 +101,13 @@ class CardinalTools:
         result = sandbox.run_terminal(
             cmd, workspace=self.config.workspace, timeout=self.config.terminal_timeout
         )
-        content = json.dumps(asdict(result), ensure_ascii=False)
+        workspace = self.config.workspace
+        # Resolve the same default as the sandbox; never store outside its workspace.
+        if workspace is None:
+            workspace = sandbox.default_workspace()
+        content = terminal_observation(
+            result, Path(workspace), max(256, min(1500, self.config.context_budget // 6))
+        )
         if result.rejected or result.timed_out or result.exit_code != 0:
             reason = result.reason if result.rejected else (
                 "Terminal command timed out" if result.timed_out else "Non-zero exit code"
